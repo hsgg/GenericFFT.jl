@@ -31,6 +31,7 @@ AbstractFFTs.fftfloat(x::AbstractFloat) = x
 AbstractFFTs.fftfloat(x::Float16) = Float32(x)
 
 
+include("engine.jl")
 include("fft.jl")
 
 end # module

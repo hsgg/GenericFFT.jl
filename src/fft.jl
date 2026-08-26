@@ -5,11 +5,14 @@ const AbstractFloats = Union{RealFloats, ComplexFloats}
 
 # The following implements Bluestein's algorithm, following http://www.dsprelated.com/dspbooks/mdft/Bluestein_s_FFT_Algorithm.html
 
-function generic_fft!(x::AbstractVector{Complex{T}}) where {T<:AbstractFloat}
+generic_fft!(x::AbstractVector{Complex{T}}) where {T<:AbstractFloat} =
+    _generic_fft_vec!(_engine(x), x)
+
+function _generic_fft_vec!(::CPUEngine, x::AbstractVector{Complex{T}}) where {T<:AbstractFloat}
     if ispow2(length(x))
         return generic_fft_pow2!(x)
     end
-    return copyto!(x, generic_fft(x))
+    return copyto!(x, _generic_fft_vec(CPUEngine(), x))
 end
 
 generic_fft!(x::AbstractVector) = copyto!(x, generic_fft(x))
@@ -31,7 +34,9 @@ end
 # Batches smaller than this are not worth the task-spawn overhead.
 const THREAD_MIN_BATCH = 16
 
-function _batched_fft_first_dim!(y::AbstractMatrix)
+_batched_fft_first_dim!(y::AbstractMatrix) = _batched_fft_first_dim!(_engine(y), y)
+
+function _batched_fft_first_dim!(::CPUEngine, y::AbstractMatrix)
     # The slices are independent, so the batch axis parallelises directly. Tasks inherit
     # the BigFloat precision of the spawning task, so an enclosing `setprecision` block
     # still applies inside the loop.
@@ -108,13 +113,49 @@ end
 # the tuple length inferable, so the `similar` calls below stay type stable.
 _setindex(sz::NTuple{N,Int}, val::Int, d::Integer) where N = ntuple(i -> i == d ? val : sz[i], N)
 
+"""
+    _like(x, v)
+
+Materialise the host-computed vector `v` as the same array type as `x`.
+
+Host-side construction plus one upload, rather than broadcasting a `Range` or a host
+`Vector` against `x` -- which would be an error for a device-resident `x`.
+"""
+_like(x::AbstractArray, v::AbstractVector) = copyto!(similar(x, eltype(v), length(v)), v)
+
+# `[a; reverse(a)]`, built via `similar` so it follows `a`'s array type instead of
+# always producing a host `Vector` the way `vcat` does.
+function _mirror(a::AbstractVector)
+    n = length(a)
+    r = similar(a, 2n)
+    @views begin
+        r[1:n] .= a
+        r[n+1:2n] .= a[n:-1:1]
+    end
+    return r
+end
+
+# `[b; 0; -reverse(b[2:end])]`, likewise built through `similar`.
+function _idct_extend(b::AbstractVector{U}) where U
+    n = length(b)
+    r = similar(b, 2n)
+    @views begin
+        r[1:n] .= b
+        r[n+1:n+1] .= zero(U)
+        r[n+2:2n] .= .-b[n:-1:2]
+    end
+    return r
+end
+
 copycomplex(A::AbstractArray{<:Complex}) = copy(A)
 copycomplex(A::AbstractArray{<:Real}) = complex(A)
 generic_fft(x, region) = generic_fft!(copycomplex(x), region)
 generic_fft(x) = generic_fft!(copycomplex(x))
 
 
-function generic_fft(x::AbstractVector{T}) where T<:AbstractFloats
+generic_fft(x::AbstractVector{T}) where T<:AbstractFloats = _generic_fft_vec(_engine(x), x)
+
+function _generic_fft_vec(::CPUEngine, x::AbstractVector{T}) where T<:AbstractFloats
     n = length(x)
     ispow2(n) && return generic_fft_pow2(x)
     S = promote_type(real(T), Float64)
@@ -125,68 +166,52 @@ function generic_fft(x::AbstractVector{T}) where T<:AbstractFloats
     return Wks .* @view _conv(xq,wq)[n+1:2n]
 end
 
-generic_bfft(x::AbstractArray{T, N}, region) where {T <: AbstractFloats, N} = conj!(generic_fft(conj(x), region))
-generic_bfft!(x::AbstractArray{T, N}, region) where {T <: AbstractFloats, N} = conj!(generic_fft!(conj!(x), region))
+generic_bfft(x::AbstractArray{T, N}, region) where {T <: AbstractFloats, N} = _conj!(generic_fft(conj(x), region))
+generic_bfft!(x::AbstractArray{T, N}, region) where {T <: AbstractFloats, N} = _conj!(generic_fft!(_conj!(x), region))
 
 _regionscale(x, region::Int) = size(x, region)
 _regionscale(x, region) = prod(size.(Ref(x), region))
 
-generic_ifft(x::AbstractArray{T, N}, region) where {T<:AbstractFloats, N} = ldiv!(T(_regionscale(x, region)), conj!(generic_fft(conj(x), region)))
-generic_ifft!(x::AbstractArray{T, N}, region) where {T<:AbstractFloats, N} = ldiv!(T(_regionscale(x, region)), conj!(generic_fft!(conj!(x), region)))
+# Scaled by broadcasting rather than `ldiv!`: LinearAlgebra's generic `ldiv!(::Number, ::AbstractArray)`
+# fallback is a scalar-indexed loop, which is a silent performance trap on array types that
+# implement broadcast but not that method.
+_scale!(A::AbstractArray, s::Number) = (A ./= s; A)
 
-generic_rfft(v::AbstractVector{T}, region) where T<:AbstractFloats = generic_fft(v, region)[1:div(length(v),2)+1]
+generic_ifft(x::AbstractArray{T, N}, region) where {T<:AbstractFloats, N} = _scale!(_conj!(generic_fft(conj(x), region)), T(_regionscale(x, region)))
+generic_ifft!(x::AbstractArray{T, N}, region) where {T<:AbstractFloats, N} = _scale!(_conj!(generic_fft!(_conj!(x), region)), T(_regionscale(x, region)))
 
+# `rfft` is the full complex transform truncated to its non-redundant half -- which is
+# exactly what the 1-D path always did. Applying it to the whole array at once, rather than
+# looping over `CartesianIndices` slices, keeps the batch intact all the way down to the
+# transform kernels, where the parallelism is.
 function generic_rfft(x::AbstractArray{T, N}, region) where {T<:AbstractFloats, N}
     d = first(region)
-    if length(region) > 1
-        return generic_fft(generic_rfft(x, d), region[2:end])
-    end
+    length(region) > 1 && return generic_fft(generic_rfft(x, d), region[2:end])
 
     nout = size(x, d) ÷ 2 + 1
-    out = similar(x, Complex{real(T)}, _setindex(size(x), nout, d))
-
-    # CartesianIndices enables iterating over slices in arbitrary dimensions
-    Rpre = CartesianIndices(size(x)[1:d-1])
-    Rpost = CartesianIndices(size(x)[d+1:end])
-
-    for Ipost in Rpost
-        for Ipre in Rpre
-            out[Ipre, :, Ipost] .= generic_rfft(view(x, Ipre, :, Ipost), 1)
-        end
-    end
+    y = generic_fft(x, d)
+    out = similar(y, _setindex(size(x), nout, d))
+    copyto!(out, selectdim(y, d, 1:nout))
     return out
 end
 
-function generic_irfft(v::AbstractVector{T}, n::Integer, region) where T<:ComplexFloats
-    m = n>>1 + 1
-    @assert length(v) == m
-    # `similar` rather than `Vector{T}(undef, n)`, so the buffer follows `v`'s array type.
-    r = similar(v, n)
-    copyto!(r, 1, v, 1, m)
-    # Hermitian extension of the second half. Written as a reverse-strided broadcast
-    # instead of a scalar loop so it stays a single vectorized pass.
-    k = n - m
-    k > 0 && @views r[m+1:n] .= conj.(v[k+1:-1:2])
-    return real(generic_ifft(r, region))
-end
-
+# Restore the redundant half by Hermitian symmetry, then take the real inverse transform.
+# As with `generic_rfft`, done across the whole array so the batch reaches the kernels.
 function generic_irfft(x::AbstractArray{T, N}, n::Integer, region) where {T<:ComplexFloats, N}
     d = first(region)
     if length(region) > 1
         return generic_irfft(generic_ifft(x, region[2:end]), n, d)
     end
 
-    out = similar(x, real(T), _setindex(size(x), Int(n), d))
-
-    Rpre = CartesianIndices(size(x)[1:d-1])
-    Rpost = CartesianIndices(size(x)[d+1:end])
-
-    for Ipost in Rpost
-        for Ipre in Rpre
-            out[Ipre, :, Ipost] .= generic_irfft(view(x, Ipre, :, Ipost), n, 1)
-        end
-    end
-    return out
+    m = n>>1 + 1
+    @assert size(x, d) == m
+    # `similar` rather than `Vector{T}(undef, n)`: the buffer follows `x`'s array type.
+    r = similar(x, _setindex(size(x), Int(n), d))
+    copyto!(selectdim(r, d, 1:m), x)
+    # Reverse-strided broadcast rather than a scalar loop, so this stays one vectorized pass.
+    k = n - m
+    k > 0 && (selectdim(r, d, m+1:n) .= conj.(selectdim(x, d, k+1:-1:2)))
+    return real(generic_ifft(r, d))
 end
 
 function generic_brfft(v::AbstractArray, n::Integer, region)
@@ -320,11 +345,14 @@ function generic_dct(a::AbstractVector{Complex{T}}) where {T <: AbstractFloat}
     T <: FFTW.fftwNumber && (@warn("Using generic dct for FFTW number type."))
     N = length(a)
     twoN = convert(T,2) * N
-    c = generic_fft([a; reverse(a, dims=1)]) # c = generic_fft([a; flipdim(a,1)])
+    c = generic_fft(_mirror(a))
     d = c[1:N]
-    d .*= exp.((-im*convert(T, pi)).*(0:N-1)./twoN)
-    d[1] = d[1] / sqrt(convert(T, 2))
-    lmul!(inv(sqrt(twoN)), d)
+    d .*= _like(d, exp.((-im*convert(T, pi)).*(0:N-1)./twoN))
+    # A length-1 view keeps this a broadcast. `d[1] = ...` is a scalar write, which array
+    # types that disallow scalar indexing reject outright.
+    @views d[1:1] ./= sqrt(convert(T, 2))
+    d .*= inv(sqrt(twoN))
+    return d
 end
 
 generic_dct(a::AbstractArray{T}) where {T <: AbstractFloat} = real(generic_dct(complex(a)))
@@ -334,11 +362,11 @@ function generic_idct(a::AbstractVector{Complex{T}}) where {T <: AbstractFloat}
     N = length(a)
     twoN = convert(T,2)*N
     b = a * sqrt(twoN)
-    b[1] = b[1] * sqrt(convert(T,2))
+    @views b[1:1] .*= sqrt(convert(T,2))
     shift = exp.(-im * 2 * convert(T, pi) * (N - convert(T,1)/2) * (0:(2N-1)) / twoN)
-    b = [b; 0; -reverse(b[2:end], dims=1)] .* shift # b = [b; 0; -flipdim(b[2:end],1)] .* shift
+    b = _idct_extend(b) .* _like(b, shift)
     c = ifft(b)
-    reverse(c[1:N]; dims=1)#flipdim(c[1:N],1)
+    return reverse(c[1:N]; dims=1)
 end
 
 generic_idct(a::AbstractArray{T}) where {T <: AbstractFloat} = real(generic_idct(complex(a)))
