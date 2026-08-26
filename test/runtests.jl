@@ -18,3 +18,4 @@ import AbstractFFTs: fft, ifft, rfft, irfft, brfft
 include("fft_tests.jl")
 include("toeplitz_tests.jl")
 include("interlace.jl")
+include("gpu_tests.jl")

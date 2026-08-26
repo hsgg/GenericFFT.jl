@@ -41,6 +41,38 @@ julia> fft(rand(Double64, 2))
  0.3969515892883767 + 0.0im
 ```
 
+## Usage on GPUs
+
+Loading a GPU array package alongside `GenericFFT` enables device-resident transforms
+through a package extension, built on
+[KernelAbstractions](https://github.com/JuliaGPU/KernelAbstractions.jl) so that it is not
+tied to any one vendor:
+
+```julia
+julia> using GenericFFT, CUDA, DoubleFloats
+
+julia> x = CuArray(randn(Complex{Double64}, 1024, 512));
+
+julia> y = fft(x, 1);      # a batch of 512 length-1024 transforms, on the device
+```
+
+The batch is what makes this worthwhile. Transforming along a dimension of an
+`n × batch` array runs the whole batch in one set of kernel launches rather than looping
+over slices, and extended-precision arithmetic such as `Double64` is compute-bound rather
+than bandwidth-bound, which suits a GPU well.
+
+Two limitations follow from what a GPU can represent:
+
+* **The element type must be `isbits`.** `BigFloat` is backed by MPFR and
+  `Quadmath.Float128` by a C `__float128`; neither can exist inside a device kernel, and
+  both are rejected with an explicit error. For extended precision on a GPU, use
+  `DoubleFloats.Double64`. `Float16` and `BFloat16` work as well, though vendor libraries
+  usually already cover those natively.
+* **Non-power-of-two lengths need `Float64` on the device.** Those go through Bluestein's
+  algorithm, which convolves in a working precision of at least `Float64` to match the CPU
+  result. Backends without `Float64` support (Metal) can therefore only transform
+  power-of-two lengths at `Float16`/`Float32`.
+
 ## Usage for low-precision FFTs
 
 ```julia
