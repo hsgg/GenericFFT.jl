@@ -19,15 +19,40 @@ function generic_fft!(x::AbstractVector{Complex{T}}, region::Integer) where {T<:
     generic_fft!(x)
 end
 
-function _generic_fft_first_dim!(x, Ipost)
-    for I in Ipost
-        generic_fft!(@view x[:, I])
-    end
+# A batch of 1-D transforms along the first dimension. In column-major order the trailing
+# dimensions are just a flat batch axis, so a single `reshape` (which never copies) exposes
+# the batch without any `CartesianIndices` bookkeeping.
+function _generic_fft_first_dim!(x)
+    n = size(x, 1)
+    _batched_fft_first_dim!(reshape(x, n, :))
     x
+end
+
+# Batches smaller than this are not worth the task-spawn overhead.
+const THREAD_MIN_BATCH = 16
+
+function _batched_fft_first_dim!(y::AbstractMatrix)
+    # The slices are independent, so the batch axis parallelises directly. Tasks inherit
+    # the BigFloat precision of the spawning task, so an enclosing `setprecision` block
+    # still applies inside the loop.
+    if Threads.nthreads() > 1 && size(y, 2) >= THREAD_MIN_BATCH
+        Threads.@threads for j in axes(y, 2)
+            generic_fft!(@view y[:, j])
+        end
+    else
+        for j in axes(y, 2)
+            generic_fft!(@view y[:, j])
+        end
+    end
+    y
 end
 
 function generic_fft!(x, region::Integer)
     @assert 1 <= region <= ndims(x)
+
+    # Dimension 1 is already contiguous, so transform in place where it lies. Permuting
+    # here would be two full-array copies for an identity permutation.
+    region == 1 && return _generic_fft_first_dim!(x)
 
     perm = ntuple(ndims(x)) do i
         if i == 1
@@ -39,11 +64,10 @@ function generic_fft!(x, region::Integer)
         end
     end
 
+    # For region > 1 we bring the transformed dimension to the front rather than striding
+    # over it: the 1-D kernels are scalar loops, and they want contiguous input.
     y = permutedims(x, perm)
-
-    Rright = CartesianIndices(size(y)[2:end])
-    y = _generic_fft_first_dim!(y, Rright)
-
+    _generic_fft_first_dim!(y)
     permutedims!(x, y, perm)
     x
 end
@@ -62,8 +86,7 @@ function generic_fft!(x)
     perm = ((2:ndims(x))..., 1)
 
     for r in 1:ndims(x)
-        Rright = CartesianIndices(size(z)[2:end])
-        _generic_fft_first_dim!(z, Rright)
+        _generic_fft_first_dim!(z)
 
         sz = (sz[2:end]..., sz[1])
         y = reshape(y, sz)
@@ -81,6 +104,10 @@ end
 # generic_fft(x, region) = generic_fft!(copy(complex(x)), region)
 # generic_fft(x) = generic_fft!(copy(complex(x)))
 
+# Replace entry `d` of a size tuple. Unlike `collect(size(x))` + `tuple(sz...)` this keeps
+# the tuple length inferable, so the `similar` calls below stay type stable.
+_setindex(sz::NTuple{N,Int}, val::Int, d::Integer) where N = ntuple(i -> i == d ? val : sz[i], N)
+
 copycomplex(A::AbstractArray{<:Complex}) = copy(A)
 copycomplex(A::AbstractArray{<:Real}) = complex(A)
 generic_fft(x, region) = generic_fft!(copycomplex(x), region)
@@ -95,7 +122,7 @@ function generic_fft(x::AbstractVector{T}) where T<:AbstractFloats
     Wks = Complex{real(T)}.(cispi.(-ks.^2 ./ S(n)))    # always Complex
     Wksrev = @view Wks[reverse(eachindex(Wks))]
     xq, wq = complex(x).*Wks, conj!([Complex{real(T)}(cispi(-S(n))); Wksrev; @view Wks[2:end]])
-    return Wks .* @view _conv!(xq,wq)[n+1:2n]
+    return Wks .* @view _conv(xq,wq)[n+1:2n]
 end
 
 generic_bfft(x::AbstractArray{T, N}, region) where {T <: AbstractFloats, N} = conj!(generic_fft(conj(x), region))
@@ -116,9 +143,7 @@ function generic_rfft(x::AbstractArray{T, N}, region) where {T<:AbstractFloats, 
     end
 
     nout = size(x, d) ÷ 2 + 1
-    sz = collect(size(x))
-    sz[d] = nout
-    out = similar(x, Complex{real(T)}, tuple(sz...))
+    out = similar(x, Complex{real(T)}, _setindex(size(x), nout, d))
 
     # CartesianIndices enables iterating over slices in arbitrary dimensions
     Rpre = CartesianIndices(size(x)[1:d-1])
@@ -133,10 +158,15 @@ function generic_rfft(x::AbstractArray{T, N}, region) where {T<:AbstractFloats, 
 end
 
 function generic_irfft(v::AbstractVector{T}, n::Integer, region) where T<:ComplexFloats
-    @assert length(v) == n>>1 + 1
-    r = Vector{T}(undef, n)
-    r[1:length(v)]=v
-    r[length(v)+1:n]=reverse(conj(v[2:end])[1:n-length(v)])
+    m = n>>1 + 1
+    @assert length(v) == m
+    # `similar` rather than `Vector{T}(undef, n)`, so the buffer follows `v`'s array type.
+    r = similar(v, n)
+    copyto!(r, 1, v, 1, m)
+    # Hermitian extension of the second half. Written as a reverse-strided broadcast
+    # instead of a scalar loop so it stays a single vectorized pass.
+    k = n - m
+    k > 0 && @views r[m+1:n] .= conj.(v[k+1:-1:2])
     return real(generic_ifft(r, region))
 end
 
@@ -146,9 +176,7 @@ function generic_irfft(x::AbstractArray{T, N}, n::Integer, region) where {T<:Com
         return generic_irfft(generic_ifft(x, region[2:end]), n, d)
     end
 
-    sz = collect(size(x))
-    sz[d] = n
-    out = similar(x, real(T), tuple(sz...))
+    out = similar(x, real(T), _setindex(size(x), Int(n), d))
 
     Rpre = CartesianIndices(size(x)[1:d-1])
     Rpost = CartesianIndices(size(x)[d+1:end])
@@ -166,17 +194,34 @@ function generic_brfft(v::AbstractArray, n::Integer, region)
     return generic_irfft(v, n, region) * scale
 end
 
-function _conv!(u::AbstractVector{T}, v::AbstractVector{T}) where T<:AbstractFloats
+"""
+    _padded(x, ::Type{U}, n)
+
+Copy `x` into a freshly allocated length-`n` array of eltype `U`, zeroing the tail.
+
+Allocated with `similar(x, ...)` so the result follows the input's array type, and written
+without resizing so `x` may be a view or a non-resizable (e.g. GPU) array.
+"""
+function _padded(x::AbstractVector, ::Type{U}, n::Integer) where U
+    nx = length(x)
+    y = similar(x, U, n)
+    copyto!(y, 1, x, 1, nx)
+    nx < n && fill!(view(y, nx+1:n), zero(U))
+    return y
+end
+
+function _conv(u::AbstractVector{T}, v::AbstractVector{T}) where T<:AbstractFloats
     nu, nv = length(u), length(v)
     n  = nu + nv - 1
     np2 = nextpow(2, n)
-    append!(u, zeros(T, np2-nu))
-    append!(v, zeros(T, np2-nv))
     S = promote_type(real(T), Float64)
-    uf = Complex{S}.(u)
-    vf = Complex{S}.(v)
+    # Zero-pad into new buffers rather than `append!`-ing the inputs: this leaves `u` and
+    # `v` unmutated (so views are allowed) and never needs a resizable array. The padded
+    # copies are free of charge, since the eltype promotion to `Complex{S}` allocated anyway.
+    uf = _padded(u, Complex{S}, np2)
+    vf = _padded(v, Complex{S}, np2)
     y = generic_ifft_pow2(generic_fft_pow2(uf) .* generic_fft_pow2(vf))
-    y = T <: Real ? T.(real(y[1:n])) : T.(y[1:n])
+    return T <: Real ? T.(real(@view y[1:n])) : T.(@view y[1:n])
 end
 
 
@@ -346,10 +391,10 @@ plan_inv(p::DummyrFFTPlan{T,inplace,G}) where {T,inplace,G} = DummyirFFTPlan{Com
 
 
 
+# The complex and trigonometric transforms have both an in-place and an out-of-place form.
 for (Plan,ff,ff!) in ((:DummyFFTPlan,:generic_fft,:generic_fft!),
                       (:DummybFFTPlan,:generic_bfft,:generic_bfft!),
                       (:DummyiFFTPlan,:generic_ifft,:generic_ifft!),
-                      (:DummyrFFTPlan,:generic_rfft,:generic_rfft!),
                       (:DummyDCTPlan,:generic_dct,:generic_dct!),
                       (:DummyiDCTPlan,:generic_idct,:generic_idct!))
     @eval begin
@@ -362,18 +407,28 @@ for (Plan,ff,ff!) in ((:DummyFFTPlan,:generic_fft,:generic_fft!),
     end
 end
 
-# Specific for irfft and brfft:
-*(p::DummyirFFTPlan{T,true}, x::StridedArray{T,N}) where {T<:AbstractFloats,N} = generic_irfft!(x, p.n, p.region)
-*(p::DummyirFFTPlan{T,false}, x::StridedArray{T,N}) where {T<:AbstractFloats,N} = generic_irfft(x, p.n, p.region)
-function mul!(C::StridedVector, p::DummyirFFTPlan, x::StridedVector)
-    C[:] = generic_irfft(x, p.n, p.region)
-    C
+# The real transforms (rfft, irfft, brfft) have no in-place form: they change the length of
+# the transformed dimension, so the result cannot alias the input. Accordingly `plan_rfft`,
+# `plan_irfft` and `plan_brfft` below all hard-code `inplace=false`, and there is
+# deliberately no `inplace=true` method here.
+for (Plan,ff) in ((:DummyrFFTPlan,:generic_rfft),)
+    @eval begin
+        *(p::$Plan{T,false}, x::StridedArray{T,N}) where {T<:AbstractFloats,N} = $ff(x, p.region)
+        function mul!(C::StridedVector, p::$Plan, x::StridedVector)
+            C[:] = $ff(x, p.region)
+            C
+        end
+    end
 end
-*(p::DummybrFFTPlan{T,true}, x::StridedArray{T,N}) where {T<:AbstractFloats,N} = generic_brfft!(x, p.n, p.region)
-*(p::DummybrFFTPlan{T,false}, x::StridedArray{T,N}) where {T<:AbstractFloats,N} = generic_brfft(x, p.n, p.region)
-function mul!(C::StridedVector, p::DummybrFFTPlan, x::StridedVector)
-    C[:] = generic_brfft(x, p.n, p.region)
-    C
+
+for (Plan,ff) in ((:DummyirFFTPlan,:generic_irfft), (:DummybrFFTPlan,:generic_brfft))
+    @eval begin
+        *(p::$Plan{T,false}, x::StridedArray{T,N}) where {T<:AbstractFloats,N} = $ff(x, p.n, p.region)
+        function mul!(C::StridedVector, p::$Plan, x::StridedVector)
+            C[:] = $ff(x, p.n, p.region)
+            C
+        end
+    end
 end
 
 

@@ -9,6 +9,10 @@ jobs:
   test:
     name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ github.event_name }}
     runs-on: ${{ matrix.os }}
+    env:
+      # Exercises the threaded batch path in _batched_fft_first_dim!. Batches below
+      # THREAD_MIN_BATCH still take the serial branch, so both are covered in one run.
+      JULIA_NUM_THREADS: auto
     strategy:
       fail-fast: false
       matrix:
